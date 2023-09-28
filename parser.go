@@ -53,48 +53,6 @@ type field struct {
 	StructOffset int
 }
 
-type llArgs struct {
-	Val  string
-	Next *llArgs
-	Prev *llArgs
-}
-
-func (ll *llArgs) Len() int {
-	next := ll
-	res := 0
-	for next != nil {
-		res++
-		next = next.Next
-	}
-	return res
-}
-
-func (ll *llArgs) String() string {
-	next := ll
-	res := make([]string, ll.Len())
-	for i := 0; i < len(res); i++ {
-		res[i] = next.Val
-		next = next.Next
-	}
-
-	return strings.Join(res, " ")
-}
-
-func newLLArgs(args []string) *llArgs {
-	res := new(llArgs)
-	next := res
-
-	for index := 0; index < len(args); index++ {
-		next.Next = new(llArgs)
-		next.Next.Prev = next
-		next = next.Next
-		next.Val = args[index]
-	}
-
-	res.Next.Prev = nil
-	return res.Next
-}
-
 func unmarshal(rv reflect.Value) error {
 	var (
 		err    error
@@ -130,16 +88,17 @@ func unmarshal(rv reflect.Value) error {
 		}
 	}
 
-	args := newLLArgs(os.Args[1:])
+	args := make([]string, len(os.Args[1:]))
+	copy(args, os.Args[1:])
 
-	if required > args.Len() {
+	if required > len(args) {
 		return &NotEnoughRequiredArgs{
 			Expected: required,
-			Actual:   args.Len(),
+			Actual:   len(args),
 		}
 	}
 
-	for index := 1; index < len(os.Args); index++ {
+	for index := 1; index < len(args); index++ {
 		if os.Args[index] == "--help" || os.Args[index] == "-h" {
 			return &HelpMessage{
 				Message: getHelpMessage(fields),
@@ -160,52 +119,37 @@ func unmarshal(rv reflect.Value) error {
 	return nil
 }
 
-func parseArg(f *field, args *llArgs) error {
-	next := args
-	removeFromLL := func(current *llArgs) {
-		if current.Next == nil && current.Prev == nil {
-			return
-		}
-
-		if current.Prev == nil {
-			current.Next.Prev = nil
-			*args = *current.Next
-		} else {
-			*current.Prev.Next = *current.Next
-			*current.Next.Prev = *current.Prev
-		}
-	}
-
-	for next != nil {
-		isFlag := strings.HasPrefix(next.Val, "-")
+func parseArg(f *field, args []string) error {
+	for index := 0; index < len(args); index++ {
+		isFlag := strings.HasPrefix(args[index], "-")
 		prevIsFlag := false
-		if next.Prev != nil {
-			prevIsFlag = strings.HasPrefix(next.Prev.Val, "-")
+		if index > 0 {
+			prevIsFlag = strings.HasPrefix(args[index-1], "-")
 		}
 
 		switch {
 		case f.TagInfo.ArgType == Arg && !isFlag && !prevIsFlag:
-			val, err := parseStringValue(f.Type, next.Val)
+			val, err := parseStringValue(f.Type, args[index])
 			if err != nil {
 				return &WrongArgValue{
 					ErrorDesc: err.Error(),
 				}
 			}
 			*f.Value = val
-			removeFromLL(next)
+			args = append(args[:index], args[index+1:]...)
 			return nil
 
-		case f.TagInfo.ArgType == Option && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, next.Val):
-			removeFromLL(next)
+		case f.TagInfo.ArgType == Option && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, args[index]):
+			index++
 
 			if f.Type.Kind() != reflect.Array && f.Type.Kind() != reflect.Slice {
-				val, err := parseStringValue(f.Type, next.Val)
+				val, err := parseStringValue(f.Type, args[index])
 				if err != nil {
 					return &WrongArgValue{
 						ErrorDesc: err.Error(),
 					}
 				}
-				removeFromLL(next)
+				args = append(args[:index-1], args[index+1:]...)
 
 				*f.Value = val
 				return nil
@@ -224,8 +168,9 @@ func parseArg(f *field, args *llArgs) error {
 			case reflect.Slice:
 				count := 0
 				vals := reflect.MakeSlice(f.Type, f.TagInfo.Nargs, f.TagInfo.Nargs)
-				for next != nil && additionalTest(next.Val) && count < f.TagInfo.Nargs {
-					val, err := parseStringValue(f.Type.Elem(), next.Val)
+				for index < len(args) && additionalTest(args[index]) && count < f.TagInfo.Nargs {
+					val, err := parseStringValue(f.Type.Elem(), args[index])
+					index++
 					if err != nil {
 						return &WrongArgValue{
 							ErrorDesc: err.Error(),
@@ -233,7 +178,6 @@ func parseArg(f *field, args *llArgs) error {
 					}
 					vals.Index(count).Set(val)
 					count++
-					removeFromLL(next)
 				}
 
 				if count < f.TagInfo.Nargs {
@@ -241,17 +185,17 @@ func parseArg(f *field, args *llArgs) error {
 						ErrorDesc: fmt.Sprintf("not enougth option values, required: %d, passed %d"),
 					}
 				}
+
+				args = append(args[:index-f.TagInfo.Nargs], args[index+1:]...)
 				*f.Value = vals
 			}
 
 			return nil
-		case f.TagInfo.ArgType == Flag && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, next.Val):
+		case f.TagInfo.ArgType == Flag && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, args[index]):
 			*f.Value = reflect.ValueOf(true)
-			removeFromLL(next)
+			args = append(args[:index], args[index+1:]...)
 			return nil
 		}
-
-		next = next.Next
 	}
 
 	if f.TagInfo.Required {
@@ -359,6 +303,10 @@ func processTags(f reflect.StructField) (*tagInfo, error) {
 
 	if info.ArgType == Flag {
 		info.Default = reflect.ValueOf(false)
+	}
+
+	if info.ArgType == Arg {
+		info.Required = true
 	}
 
 	for index := 1; index < len(params); index++ {
@@ -530,6 +478,7 @@ func postJson(vt reflect.Type, data any) (reflect.Value, error) {
 			res.Index(i).Set(val)
 		}
 		return res, nil
+
 	case reflect.Map:
 		dv := reflect.ValueOf(data)
 		res := reflect.MakeMapWithSize(vt, dv.Len())
@@ -547,6 +496,7 @@ func postJson(vt reflect.Type, data any) (reflect.Value, error) {
 			res.SetMapIndex(kv, vv)
 		}
 		return res, nil
+
 	case reflect.Struct:
 		dv := reflect.ValueOf(data)
 		if dv.Kind() != reflect.Map || dv.Type().Key().Kind() != reflect.String {
