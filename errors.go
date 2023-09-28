@@ -73,10 +73,15 @@ func (e *NotEnoughRequiredArgs) Error() string {
 
 type ArgNotFound struct {
 	ArgType ArgType
+	Extra   string
 }
 
 func (e *ArgNotFound) Error() string {
-	return fmt.Sprintf("argument of type %s not passed to args", e.ArgType)
+	res := fmt.Sprintf("argument of type %s not passed to args", e.ArgType)
+	if e.ArgType != Arg {
+		res = fmt.Sprintf("%s: %s", res, e.Extra)
+	}
+	return res
 }
 
 type WrongArgValue struct {
@@ -85,4 +90,13 @@ type WrongArgValue struct {
 
 func (e *WrongArgValue) Error() string {
 	return fmt.Sprintf("wrong argument value: %s", e.ErrorDesc)
+}
+
+type WrongValueType struct {
+	Expected string
+	Actual   string
+}
+
+func (e *WrongValueType) Error() string {
+	return fmt.Sprintf("value type differ from expected %s != %s", e.Expected, e.Actual)
 }

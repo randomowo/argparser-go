@@ -1,6 +1,7 @@
 # TODO:
 - [x] basic types
-- [ ] complex types (like array, json, struc, etc)
+- [x] complex types (like array, json, structs, etc)
+- [ ] better help message
 - [ ] documentation
 - [ ] tests
 - [ ] arg groups

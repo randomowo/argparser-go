@@ -23,10 +23,27 @@ func Unmarshal(v any) error {
 type tagInfo struct {
 	ArgType  ArgType
 	Required bool
-	Default  any
+	Default  reflect.Value
 	Help     string
 	Flags    []string
 	Nargs    int
+}
+
+func (t *tagInfo) String() string {
+	if t.ArgType == Arg {
+		return fmt.Sprintf("required:%v, default:%v", t.Required, t.Default.Interface())
+	}
+	var defaultValue interface{}
+	if t.Default.Kind() != reflect.Invalid {
+		defaultValue = t.Default.Interface()
+	}
+	return fmt.Sprintf(
+		"required:%v, default:%v, flags:%v, nargs:%d",
+		t.Required,
+		defaultValue,
+		t.Flags,
+		t.Nargs,
+	)
 }
 
 type field struct {
@@ -97,6 +114,10 @@ func unmarshal(rv reflect.Value) error {
 			}
 
 			if i < j && fields[i].TagInfo.ArgType == Arg {
+				// preserver args position
+				if fields[j].TagInfo.ArgType == Arg && fields[i].StructOffset < fields[j].StructOffset {
+					continue
+				}
 				fields[i], fields[j] = fields[j], fields[i]
 			}
 		}
@@ -142,6 +163,10 @@ func unmarshal(rv reflect.Value) error {
 func parseArg(f *field, args *llArgs) error {
 	next := args
 	removeFromLL := func(current *llArgs) {
+		if current.Next == nil && current.Prev == nil {
+			return
+		}
+
 		if current.Prev == nil {
 			current.Next.Prev = nil
 			*args = *current.Next
@@ -166,9 +191,10 @@ func parseArg(f *field, args *llArgs) error {
 					ErrorDesc: err.Error(),
 				}
 			}
-			*f.Value = reflect.ValueOf(val)
+			*f.Value = val
 			removeFromLL(next)
 			return nil
+
 		case f.TagInfo.ArgType == Option && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, next.Val):
 			removeFromLL(next)
 
@@ -181,7 +207,7 @@ func parseArg(f *field, args *llArgs) error {
 				}
 				removeFromLL(next)
 
-				*f.Value = reflect.ValueOf(val)
+				*f.Value = val
 				return nil
 			}
 
@@ -192,35 +218,33 @@ func parseArg(f *field, args *llArgs) error {
 				return true
 			}
 
-			vals := make([]string, 0)
-			for next != nil && additionalTest(next.Val) && len(vals) < f.TagInfo.Nargs {
-				vals = append(vals, next.Val)
-				removeFromLL(next)
-			}
-
-			if len(vals) < f.TagInfo.Nargs {
-				return &WrongArgValue{
-					ErrorDesc: fmt.Sprintf("not enougth option values, required: %d, passed %d"),
+			switch f.Type.Kind() {
+			case reflect.Array:
+				// TODO:
+			case reflect.Slice:
+				count := 0
+				vals := reflect.MakeSlice(f.Type, f.TagInfo.Nargs, f.TagInfo.Nargs)
+				for next != nil && additionalTest(next.Val) && count < f.TagInfo.Nargs {
+					val, err := parseStringValue(f.Type.Elem(), next.Val)
+					if err != nil {
+						return &WrongArgValue{
+							ErrorDesc: err.Error(),
+						}
+					}
+					vals.Index(count).Set(val)
+					count++
+					removeFromLL(next)
 				}
-			}
 
-			encoded, err := json.Marshal(vals)
-			if err != nil {
-				return &WrongArgValue{
-					ErrorDesc: err.Error(),
+				if count < f.TagInfo.Nargs {
+					return &WrongArgValue{
+						ErrorDesc: fmt.Sprintf("not enougth option values, required: %d, passed %d"),
+					}
 				}
+				*f.Value = vals
 			}
 
-			val, err := parseStringValue(f.Type, string(encoded))
-			if err != nil {
-				return &WrongArgValue{
-					ErrorDesc: err.Error(),
-				}
-			}
-
-			*f.Value = reflect.ValueOf(val)
 			return nil
-
 		case f.TagInfo.ArgType == Flag && isFlag && slices.Contains[[]string, string](f.TagInfo.Flags, next.Val):
 			*f.Value = reflect.ValueOf(true)
 			removeFromLL(next)
@@ -231,11 +255,11 @@ func parseArg(f *field, args *llArgs) error {
 	}
 
 	if f.TagInfo.Required {
-		return &ArgNotFound{ArgType: f.TagInfo.ArgType}
+		return &ArgNotFound{ArgType: f.TagInfo.ArgType, Extra: f.TagInfo.String()}
 	}
 
-	if f.TagInfo.Default != nil {
-		*f.Value = reflect.ValueOf(f.TagInfo.Default)
+	if f.TagInfo.Default.Kind() != reflect.Invalid {
+		*f.Value = f.TagInfo.Default
 		return nil
 	}
 
@@ -334,7 +358,7 @@ func processTags(f reflect.StructField) (*tagInfo, error) {
 	}
 
 	if info.ArgType == Flag {
-		info.Default = false
+		info.Default = reflect.ValueOf(false)
 	}
 
 	for index := 1; index < len(params); index++ {
@@ -405,7 +429,7 @@ func processTags(f reflect.StructField) (*tagInfo, error) {
 			}
 		}
 
-		if _, ok := val.(bool); info.ArgType == Flag && !ok {
+		if info.ArgType == Flag && val.Kind() != reflect.Bool {
 			return nil, &NotValidTag{
 				FieldName: f.Name,
 				TagName:   defaultTagName,
@@ -419,65 +443,148 @@ func processTags(f reflect.StructField) (*tagInfo, error) {
 	return info, nil
 }
 
-func parseStringValue(ft reflect.Type, s string) (any, error) {
-	var parseFunc func(string) (any, error)
+func parseStringValue(ft reflect.Type, s string) (reflect.Value, error) {
+	var parseFunc func(string) (reflect.Value, error)
 
 	switch ft.Kind() {
 	case reflect.Struct, reflect.Slice, reflect.Array, reflect.Map:
-		parseFunc = func(str string) (any, error) {
-			res := reflect.Zero(ft).Interface()
-			if err := json.Unmarshal([]byte(s), &res); err != nil {
-				return nil, err
+		parseFunc = func(str string) (reflect.Value, error) {
+			data := reflect.Zero(ft).Interface()
+			if err := json.Unmarshal([]byte(s), &data); err != nil {
+				return reflect.Value{}, err
+			}
+
+			res, err := postJson(ft, data)
+			if err != nil {
+				return reflect.Value{}, err
 			}
 
 			return res, nil
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		parseFunc = func(str string) (any, error) {
+		parseFunc = func(str string) (reflect.Value, error) {
 			val, err := strconv.ParseInt(str, 10, 64)
 			if err != nil {
-				return nil, err
+				return reflect.Value{}, err
 			}
 			if reflect.Zero(ft).OverflowInt(val) {
-				return nil, errors.New("int value bigger then field type")
+				return reflect.Value{}, errors.New("int value bigger then field type")
 			}
-			return val, nil
+			return reflect.ValueOf(val), nil
 		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		parseFunc = func(str string) (any, error) {
+		parseFunc = func(str string) (reflect.Value, error) {
 			val, err := strconv.ParseUint(str, 10, 64)
 			if err != nil {
-				return nil, err
+				return reflect.Value{}, err
 			}
 			if reflect.Zero(ft).OverflowUint(val) {
-				return nil, errors.New("uint value bigger then field type")
+				return reflect.Value{}, errors.New("uint value bigger then field type")
 			}
-			return val, nil
+			return reflect.ValueOf(val), nil
 		}
 	case reflect.Float32, reflect.Float64:
-		parseFunc = func(str string) (any, error) {
+		parseFunc = func(str string) (reflect.Value, error) {
 			val, err := strconv.ParseFloat(str, 64)
 			if err != nil {
-				return nil, err
+				return reflect.Value{}, err
 			}
 			if reflect.Zero(ft).OverflowFloat(val) {
-				return nil, errors.New("float value bigger then field type")
+				return reflect.Value{}, errors.New("float value bigger then field type")
 			}
-			return val, nil
+			return reflect.ValueOf(val), nil
 		}
 	case reflect.Bool:
-		parseFunc = func(str string) (any, error) {
-			return strconv.ParseBool(str)
+		parseFunc = func(str string) (reflect.Value, error) {
+			val, err := strconv.ParseBool(str)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			return reflect.ValueOf(val), nil
 		}
 	case reflect.String:
-		parseFunc = func(str string) (any, error) {
-			return str, nil
+		parseFunc = func(str string) (reflect.Value, error) {
+			return reflect.ValueOf(str), nil
 		}
 	default:
-		parseFunc = func(str string) (any, error) {
-			return nil, errors.New(fmt.Sprintf("unsupported type %s of default value %s", ft, str))
+		parseFunc = func(str string) (reflect.Value, error) {
+			return reflect.Value{}, errors.New(fmt.Sprintf("unsupported type %s of default value %s", ft, str))
 		}
 	}
 
 	return parseFunc(s)
+}
+
+func postJson(vt reflect.Type, data any) (reflect.Value, error) {
+	switch vt.Kind() {
+	case reflect.Array:
+		// TODO:
+	case reflect.Slice:
+		dv := reflect.ValueOf(data)
+		res := reflect.MakeSlice(vt, dv.Len(), dv.Len())
+		for i := 0; i < dv.Len(); i++ {
+			val, err := postJson(vt.Elem(), dv.Index(i).Interface())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			res.Index(i).Set(val)
+		}
+		return res, nil
+	case reflect.Map:
+		dv := reflect.ValueOf(data)
+		res := reflect.MakeMapWithSize(vt, dv.Len())
+		iter := dv.MapRange()
+		for iter.Next() {
+			k, v := iter.Key(), iter.Value()
+			kv, err := postJson(vt.Key(), k.Interface())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			vv, err := postJson(vt.Elem(), v.Interface())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			res.SetMapIndex(kv, vv)
+		}
+		return res, nil
+	case reflect.Struct:
+		dv := reflect.ValueOf(data)
+		if dv.Kind() != reflect.Map || dv.Type().Key().Kind() != reflect.String {
+			return reflect.Value{}, &WrongValueType{
+				Expected: "map[string]any",
+				Actual:   dv.Type().String(),
+			}
+		}
+
+		structKeys := make(map[string]struct{})
+
+		for _, sf := range reflect.VisibleFields(vt) {
+			structKeys[sf.Name] = struct{}{}
+		}
+
+		res := reflect.New(vt)
+		iter := dv.MapRange()
+		for iter.Next() {
+			k := iter.Key().Interface().(string)
+			if _, ok := structKeys[strings.ToTitle(k)]; ok {
+				f := res.Elem().FieldByName(strings.ToTitle(k))
+				val, err := postJson(f.Type(), iter.Value().Interface())
+				if err != nil {
+					return reflect.Value{}, err
+				}
+				f.Set(val)
+			}
+		}
+		return res.Elem(), nil
+	default:
+		if !reflect.ValueOf(data).CanConvert(vt) {
+			return reflect.Value{}, &WrongValueType{
+				Expected: vt.String(),
+				Actual:   reflect.ValueOf(data).Type().String(),
+			}
+		}
+		return reflect.ValueOf(data).Convert(vt), nil
+	}
+
+	return reflect.ValueOf(data), nil
 }
